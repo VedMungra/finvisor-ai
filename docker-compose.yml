@@ -1,0 +1,85 @@
+# Full local stack: MongoDB + Redis + FastAPI backend + nginx-served React frontend.
+#
+# The top-level `version:` key was removed deliberately -- it has been obsolete since Compose
+# v2 and every `docker compose` invocation printed a deprecation warning because of it.
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      # These override whatever is in .env, because .env holds the values for running the
+      # backend directly on the host (where both services are reachable on localhost). Inside
+      # the compose network they resolve by service name instead.
+      #
+      # REDIS_URL in particular was previously NOT overridden here, which meant the container
+      # fell back to agent.py's `redis://localhost:6379` default -- localhost inside the
+      # backend container, where nothing is listening. The result was silent: Redis caching
+      # simply never worked under docker compose, logged one warning at startup, and every
+      # yfinance call went to Yahoo uncached (exactly the rate-limiting the cache exists to
+      # prevent).
+      MONGODB_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379
+      # The browser talks to the frontend on :5173, so that is the origin the API must allow.
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - chroma_data:/app/chroma_db
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Vite inlines env vars at BUILD time, so this cannot be supplied as a runtime
+        # `environment:` entry the way the backend's config is -- by the time nginx serves
+        # the bundle the value is already baked in. It also cannot come from frontend/.env,
+        # because frontend/.dockerignore (correctly) excludes .env from the build context.
+        # Without this build arg the bundle shipped `undefined` as its API base URL and every
+        # request went to `undefined/chat`.
+        #
+        # This is the URL the *browser* uses, not a compose-network hostname: the React app
+        # runs on the user's machine, where the backend is reachable via the published port.
+        VITE_API_URL: http://localhost:8000
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  mongo_data:
+  chroma_data:

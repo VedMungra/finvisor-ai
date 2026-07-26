@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+venv/
+.env
+chroma_db/
+uploaded_docs/
+*.out
+finvisor.db

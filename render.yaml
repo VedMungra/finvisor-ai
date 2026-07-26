@@ -1,0 +1,83 @@
+# Render deployment for the FastAPI backend.
+#
+# The frontend is deployed separately (see frontend/vercel.json); only the API is hosted here.
+#
+# Note on storage: nothing this service needs is written to Render's local disk, which is
+# ephemeral on the free plan. Original PDFs and generated charts live in MongoDB GridFS and
+# document metadata/feedback live in MongoDB collections (see mongo_storage.py / db.py), so a
+# redeploy loses nothing. The one exception is the ChromaDB vector index, which is rebuilt
+# from ./data at build time by the `python ingest.py` step below.
+
+services:
+  - type: web
+    name: finvisor-backend
+    env: python
+    plan: free
+    region: ohio
+
+    # Three things happen at build time, all of them deliberately moved off the request path:
+    #   1. install dependencies
+    #   2. pre-download BOTH retrieval models -- the bi-encoder AND the cross-encoder reranker.
+    #      The previous version of this file only warmed the bi-encoder, so the first query
+    #      after every deploy still paid a cold download for the reranker while the user
+    #      waited, and free instances have little enough memory/CPU that this was slow.
+    #   3. build the vector index from ./data
+    buildCommand: >-
+      cd backend &&
+      pip install -r requirements.txt &&
+      python -c "from langchain_huggingface import HuggingFaceEmbeddings; HuggingFaceEmbeddings(model_name='BAAI/bge-small-en-v1.5', model_kwargs={'device':'cpu'})" &&
+      python -c "from langchain_community.cross_encoders import HuggingFaceCrossEncoder; HuggingFaceCrossEncoder(model_name='cross-encoder/ms-marco-MiniLM-L-6-v2')" &&
+      python ingest.py
+
+    startCommand: "cd backend && uvicorn api:app --host 0.0.0.0 --port $PORT"
+
+    # Render polls this to decide whether a deploy succeeded and whether the instance is live.
+    # /health is dependency-aware and never loads a model, so it stays fast and honest.
+    healthCheckPath: /health
+
+    envVars:
+      # Matches the local dev interpreter and the Docker image; 3.10 was drifting from both.
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+      # --- Persistence (required) ---
+      # Without MONGODB_URI the app cannot store uploads, charts, metadata or feedback. This
+      # was missing from the previous version of this file entirely, so a deploy straight from
+      # this blueprint came up pointing at mongodb://localhost:27017 -- nothing listening --
+      # and every upload failed. Set this to a MongoDB Atlas connection string.
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: finvisor
+
+      # --- Model provider chains (tried left to right, automatic fallback on any error) ---
+      - key: GRADER_PROVIDERS
+        value: groq,gemini
+      - key: SYNTHESIS_PROVIDERS
+        value: gemini,groq
+      - key: VISION_PROVIDERS
+        value: gemini
+
+      # --- API keys (set these in the Render dashboard, never in this file) ---
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      # Only needed if 'claude' appears in one of the provider chains above.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      # --- CORS ---
+      # Must list the deployed frontend's origin. A wrong value here is invisible server-side
+      # and shows up only as a browser console CORS error, so it is worth setting explicitly
+      # rather than relying on a wildcard.
+      - key: CORS_ORIGINS
+        sync: false
+
+      # --- Optional: Redis caching for yfinance calls ---
+      # The app runs fine without it (the cache is best-effort and failures are non-fatal),
+      # but setting it materially reduces the chance of hitting Yahoo Finance rate limits.
+      - key: REDIS_URL
+        sync: false

@@ -1,0 +1,37 @@
+# Node/Frontend
+node_modules/
+dist/
+build/
+.env
+.env.local
+.DS_Store
+
+# Python/Backend
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+backend/*.png
+backend/chroma_db/
+backend/uploaded_docs/
+
+# Local DB or large data files
+*.sqlite3
+*.db
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
