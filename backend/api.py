@@ -68,7 +68,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from typing import Any, Callable, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -79,6 +79,8 @@ from langchain_core.messages import HumanMessage
 from agent import app as agent_app, get_retriever_instance, get_primary_llm
 from ingest import process_and_ingest, extract_text_from_pdf
 from mongo_storage import save_pdf, load_chart
+from auth import get_current_user, get_optional_user
+from auth_routes import router as auth_router
 import db
 
 
@@ -309,6 +311,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Financial Advisor AI API", lifespan=lifespan)
 
+# Mount the auth sub-router at /auth
+app.include_router(auth_router, prefix="/auth")
+
 
 # ---------------------------------------------------------------------------
 # Middleware
@@ -477,6 +482,7 @@ class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=16000)
     thread_id: str = Field(..., min_length=1, max_length=200)
     source_filename: Optional[str] = None
+    context_key: Optional[str] = None  # For chat history persistence
 
     @field_validator("source_filename")
     @classmethod
@@ -616,7 +622,7 @@ NO_ANSWER_FALLBACK = (
 
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, req: Request):
     """
     Runs one turn of the agent graph and returns {"response": str, "chart_base64": str|None}.
 
@@ -700,6 +706,35 @@ def chat(request: ChatRequest):
             f"fallback response (chart present: {chart_base64 is not None})."
         )
 
+    # Persist chat messages if user is authenticated
+    user = get_optional_user(req)
+    if user and request.context_key:
+        ctx = request.context_key
+        try:
+            db.save_chat_message(
+                user_id=user["user_id"],
+                thread_id=request.thread_id,
+                context_key=ctx,
+                role="user",
+                content=request.prompt,
+            )
+            extra = {}
+            if chart_base64:
+                extra["has_chart"] = True
+                if chart_ids:
+                    extra["chart_id"] = chart_ids[-1]
+            db.save_chat_message(
+                user_id=user["user_id"],
+                thread_id=request.thread_id,
+                context_key=ctx,
+                role="agent",
+                content=ai_text,
+                extra=extra if extra else None,
+            )
+        except Exception as e:
+            # Chat persistence failure must never break the response
+            logger.warning(f"Could not persist chat history: {e}")
+
     logger.info(f"Successfully processed chat response for thread '{request.thread_id}'")
     return {"response": ai_text, "chart_base64": chart_base64}
 
@@ -745,6 +780,36 @@ def get_documents():
     except Exception as e:
         logger.error(f"Error fetching documents: {e}", exc_info=True)
         raise _dependency_error(e, "Could not list documents")
+
+
+@app.delete("/documents/{filename}")
+def delete_document(filename: str):
+    """
+    Deletes a specific document across all storage layers: MongoDB metadata,
+    GridFS raw bytes, and ChromaDB vector chunks.
+    """
+    try:
+        # 1. Delete MongoDB metadata
+        db.delete_document_metadata(filename)
+        
+        # 2. Delete GridFS raw bytes
+        import mongo_storage
+        mongo_storage.delete_pdf(filename)
+        
+        # 3. Delete ChromaDB vector chunks
+        retriever_instance = _retriever()
+        data = retriever_instance.vectorstore.get(where={"source": filename})
+        ids = data.get("ids") or []
+        if ids:
+            retriever_instance.vectorstore.delete(ids=ids)
+            
+        logger.info(f"Successfully deleted document '{filename}' (purged {len(ids)} chunks).")
+        return {"message": f"Document '{filename}' deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting document '{filename}': {e}", exc_info=True)
+        raise _dependency_error(e, f"Could not delete document '{filename}'")
 
 
 @app.delete("/documents")
@@ -1061,7 +1126,7 @@ class FeedbackRequest(BaseModel):
 
 
 @app.post("/feedback")
-def submit_feedback(request: FeedbackRequest):
+def submit_feedback(request: FeedbackRequest, req: Request):
     """
     Records a thumbs up/down on a specific answer. This is the feedback loop referenced in
     the README: reviewing a stream of (question, answer, rating, comment) rows over time is
@@ -1070,6 +1135,10 @@ def submit_feedback(request: FeedbackRequest):
     """
     if request.rating not in ("up", "down"):
         raise HTTPException(status_code=422, detail="rating must be 'up' or 'down'")
+
+    user = get_optional_user(req)
+    user_id = user["user_id"] if user else None
+
     try:
         db.record_feedback(
             thread_id=request.thread_id,
@@ -1078,6 +1147,7 @@ def submit_feedback(request: FeedbackRequest):
             answer=request.answer,
             rating=request.rating,
             comment=request.comment,
+            user_id=user_id,
         )
         return {"message": "Feedback recorded"}
     except HTTPException:
@@ -1106,6 +1176,91 @@ def document_stats():
     except Exception as e:
         logger.error(f"Error fetching document stats: {e}", exc_info=True)
         raise _dependency_error(e, "Could not fetch document stats")
+
+
+# ---------------------------------------------------------------------------
+# Portfolio (authenticated)
+# ---------------------------------------------------------------------------
+
+class PortfolioAddRequest(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=20)
+
+
+@app.get("/portfolio")
+def get_portfolio(user: dict = Depends(get_current_user)):
+    """Returns the authenticated user's ticker watchlist."""
+    try:
+        tickers = db.get_portfolio(user["user_id"])
+        return {"tickers": tickers}
+    except Exception as e:
+        logger.error(f"Error fetching portfolio: {e}", exc_info=True)
+        raise _dependency_error(e, "Could not fetch portfolio")
+
+
+@app.post("/portfolio")
+def add_to_portfolio(request: PortfolioAddRequest, user: dict = Depends(get_current_user)):
+    """Adds a ticker to the authenticated user's watchlist."""
+    try:
+        tickers = db.add_to_portfolio(user["user_id"], request.ticker)
+        return {"tickers": tickers}
+    except Exception as e:
+        logger.error(f"Error adding to portfolio: {e}", exc_info=True)
+        raise _dependency_error(e, "Could not update portfolio")
+
+
+@app.delete("/portfolio/{ticker}")
+def remove_from_portfolio(ticker: str, user: dict = Depends(get_current_user)):
+    """Removes a ticker from the authenticated user's watchlist."""
+    try:
+        tickers = db.remove_from_portfolio(user["user_id"], ticker)
+        return {"tickers": tickers}
+    except Exception as e:
+        logger.error(f"Error removing from portfolio: {e}", exc_info=True)
+        raise _dependency_error(e, "Could not update portfolio")
+
+
+# ---------------------------------------------------------------------------
+# Chat history (authenticated)
+# ---------------------------------------------------------------------------
+
+@app.get("/chat-history")
+def get_chat_threads(user: dict = Depends(get_current_user)):
+    """Returns all conversation contexts for the authenticated user."""
+    try:
+        threads = db.get_user_threads(user["user_id"])
+        return {"threads": threads}
+    except Exception as e:
+        logger.error(f"Error fetching chat threads: {e}", exc_info=True)
+        raise _dependency_error(e, "Could not fetch chat history")
+
+
+@app.get("/chat-history/{context_key:path}")
+def get_chat_history(context_key: str, user: dict = Depends(get_current_user)):
+    """Returns all messages for a specific conversation context."""
+    try:
+        messages = db.get_chat_history(user["user_id"], context_key)
+        for m in messages:
+            if m.get("extra") and m["extra"].get("chart_id"):
+                import base64
+                from mongo_storage import load_chart
+                chart_bytes = load_chart(m["extra"]["chart_id"])
+                if chart_bytes:
+                    m["extra"]["chart_base64"] = base64.b64encode(chart_bytes).decode("utf-8")
+        return {"messages": messages}
+    except Exception as e:
+        logger.error(f"Error fetching chat history: {e}", exc_info=True)
+        raise _dependency_error(e, "Could not fetch chat history")
+
+
+@app.delete("/chat-history/{context_key:path}")
+def delete_chat_history(context_key: str, user: dict = Depends(get_current_user)):
+    """Clears all messages for a specific conversation context."""
+    try:
+        deleted = db.delete_chat_history(user["user_id"], context_key)
+        return {"message": f"Deleted {deleted} messages.", "deleted_count": deleted}
+    except Exception as e:
+        logger.error(f"Error deleting chat history: {e}", exc_info=True)
+        raise _dependency_error(e, "Could not delete chat history")
 
 
 if __name__ == "__main__":

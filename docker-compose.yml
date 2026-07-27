@@ -49,6 +49,8 @@ services:
       # prevent).
       MONGODB_URI: mongodb://mongo:27017
       REDIS_URL: redis://redis:6379
+      # Dev-only JWT secret -- production deployments MUST override this.
+      JWT_SECRET_KEY: finvisor-docker-dev-secret-change-in-production
       # The browser talks to the frontend on :5173, so that is the origin the API must allow.
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     depends_on:

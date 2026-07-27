@@ -69,6 +69,10 @@ The app integrates a fully dynamic **React/Vite** dashboard, a local **ChromaDB 
 *   **The Feature:** `Dockerfile`s for both backend (Python slim image) and frontend (multi-stage Node build served via nginx), wired together with `docker-compose.yml` alongside a local MongoDB container for full dev/prod parity.
 *   **The Impact:** `docker compose up --build` brings up the entire stack -- frontend, backend, and database -- with zero manual setup, in addition to the existing Render deployment path.
 
+### 11. User Authentication & Profiles -- *New*
+*   **The Feature:** JWT-based multi-user authentication (register/login), per-user investment portfolios (ticker watchlists persisted in MongoDB), and persistent chat histories that survive page refreshes and browser restarts.
+*   **The Impact:** Transforms Finvisor from a single-user tool into a multi-user platform where each user has isolated data -- their own portfolio, their own chat histories, their own feedback trail. The auth system uses bcrypt password hashing and HS256 JWT tokens, with a premium glassmorphism login/register UI matching the existing Dark Obsidian aesthetic.
+
 ---
 
 ## 📊 System Benchmarks & Performance Metrics
@@ -232,6 +236,8 @@ See `backend/.env.example` for the full annotated list. The essentials:
 | `MONGODB_URI` | Yes | `mongodb://localhost:27017` for local dev, or an Atlas `mongodb+srv://...` connection string |
 | `MONGODB_DB_NAME` | Optional | Defaults to `finvisor` |
 | `REDIS_URL` | Optional | `redis://localhost:6379` for local dev caching |
+| `JWT_SECRET_KEY` | Optional | Secret for signing JWT auth tokens. Default: `finvisor-dev-secret-change-in-production`. **Must** be changed for production |
+| `JWT_EXPIRY_MINUTES` | Optional | JWT token lifetime. Default: `1440` (24 hours) |
 | `CORS_ORIGINS` | Optional | Comma-separated browser origins allowed to call the API. Default: `http://localhost:5173,http://127.0.0.1:5173`. Set this when deploying, or the browser blocks the deployed frontend |
 | `CHROMA_DB_DIR` | Optional | Vector-store location. Defaults to `backend/chroma_db`, resolved relative to the source file rather than the working directory |
 | `MAX_UPLOAD_MB` | Optional | Upload size cap. Default `25` |
@@ -273,8 +279,8 @@ This project has evolved from its original single-provider, local-disk design in
 
 ## 🔮 Future Improvements
 
-*   **User Authentication & Profiles:** Support for multi-user login, saving customized investment portfolios, and persisting individual chat histories.
-*   **Frontend Feedback UI:** Wire up thumbs up/down buttons in the React frontend to the existing `POST /feedback` endpoint (the backend and schema are ready; the UI isn't yet).
+*   ~~**User Authentication & Profiles:** Support for multi-user login, saving customized investment portfolios, and persisting individual chat histories.~~ ✅ **Done** — JWT auth, per-user portfolios, persistent chat histories.
+*   ~~**Frontend Feedback UI:** Wire up thumbs up/down buttons in the React frontend to the existing `POST /feedback` endpoint.~~ ✅ **Done** — Integrated thumbs up/down buttons to record user feedback.
 *   **Feedback Analytics Endpoint:** A `GET /feedback/summary` endpoint aggregating ratings by document/ticker to make the feedback loop visible and actionable, not just recorded.
 *   **Automated Testing & CI:** `pytest` coverage for the vision tool's rendering logic and the MongoDB CRUD helpers, plus a GitHub Actions workflow running them on every push.
 *   **Extended Data Providers:** Add tools for AlphaVantage or Bloomberg APIs to pull even deeper fundamental financial metrics and options chain data.

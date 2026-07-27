@@ -1,5 +1,5 @@
 """
-Document metadata + user feedback storage (MongoDB collections).
+Document metadata, user feedback, user accounts, portfolios, and chat history (MongoDB collections).
 
 Why MongoDB instead of a separate SQL database:
 This originally used SQLAlchemy (SQLite locally, Postgres in production) for this data,
@@ -21,12 +21,16 @@ uses for GridFS file storage -- rather than opening a second connection.
 import datetime
 import logging
 
+from bson import ObjectId
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
 logger = logging.getLogger("DB")
 
 DOCUMENTS_COLLECTION = "documents"
 FEEDBACK_COLLECTION = "feedback"
+USERS_COLLECTION = "users"
+PORTFOLIOS_COLLECTION = "portfolios"
+CHAT_HISTORY_COLLECTION = "chat_history"
 
 
 def _get_db():
@@ -77,7 +81,35 @@ def init_db():
             f"Startup continues; feedback lookups by thread will be slower."
         )
 
-    logger.info(f"MongoDB collections ready ('{DOCUMENTS_COLLECTION}', '{FEEDBACK_COLLECTION}')")
+    # --- Auth & profile indexes ---
+    try:
+        db[USERS_COLLECTION].create_index("email", unique=True)
+    except (DuplicateKeyError, OperationFailure) as e:
+        logger.error(
+            f"Could not create the unique index on '{USERS_COLLECTION}.email': {e}. "
+            f"Startup continues; duplicate emails may cause registration errors."
+        )
+
+    try:
+        db[PORTFOLIOS_COLLECTION].create_index("user_id", unique=True)
+    except OperationFailure as e:
+        logger.error(
+            f"Could not create the index on '{PORTFOLIOS_COLLECTION}.user_id': {e}. "
+            f"Startup continues."
+        )
+
+    try:
+        db[CHAT_HISTORY_COLLECTION].create_index([("user_id", 1), ("context_key", 1)])
+    except OperationFailure as e:
+        logger.error(
+            f"Could not create the index on '{CHAT_HISTORY_COLLECTION}': {e}. "
+            f"Startup continues; chat history queries will be slower."
+        )
+
+    logger.info(
+        f"MongoDB collections ready ('{DOCUMENTS_COLLECTION}', '{FEEDBACK_COLLECTION}', "
+        f"'{USERS_COLLECTION}', '{PORTFOLIOS_COLLECTION}', '{CHAT_HISTORY_COLLECTION}')"
+    )
 
 
 def _find_duplicate_filenames(db, limit: int = 10):
@@ -115,10 +147,17 @@ def record_document(filename: str, content_type: str, chunk_count: int, has_orig
     )
 
 
-def record_feedback(thread_id: str, source_filename: str, question: str, answer: str,
-                     rating: str, comment: str = None):
+def delete_document_metadata(filename: str) -> bool:
+    """Deletes a document's metadata row. Returns True if a document was deleted."""
     db = _get_db()
-    db[FEEDBACK_COLLECTION].insert_one({
+    result = db[DOCUMENTS_COLLECTION].delete_one({"filename": filename})
+    return result.deleted_count > 0
+
+
+def record_feedback(thread_id: str, source_filename: str, question: str, answer: str,
+                     rating: str, comment: str = None, user_id: str = None):
+    db = _get_db()
+    doc = {
         "thread_id": thread_id,
         "source_filename": source_filename,
         "question": question,
@@ -126,7 +165,10 @@ def record_feedback(thread_id: str, source_filename: str, question: str, answer:
         "rating": rating,
         "comment": comment,
         "created_at": datetime.datetime.now(datetime.timezone.utc),
-    })
+    }
+    if user_id:
+        doc["user_id"] = user_id
+    db[FEEDBACK_COLLECTION].insert_one(doc)
 
 
 def get_all_documents():
@@ -138,3 +180,139 @@ def get_all_documents():
     """
     db = _get_db()
     return list(db[DOCUMENTS_COLLECTION].find({}, {"_id": 0}).sort("uploaded_at", -1))
+
+
+# ---------------------------------------------------------------------------
+# User management
+# ---------------------------------------------------------------------------
+
+def create_user(username: str, email: str, hashed_password: str) -> dict:
+    """Creates a new user document and returns it (with _id set by Mongo)."""
+    db = _get_db()
+    doc = {
+        "username": username,
+        "email": email,
+        "hashed_password": hashed_password,
+        "created_at": datetime.datetime.now(datetime.timezone.utc),
+    }
+    result = db[USERS_COLLECTION].insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return doc
+
+
+def get_user_by_email(email: str):
+    """Returns the user document for the given email, or None."""
+    db = _get_db()
+    return db[USERS_COLLECTION].find_one({"email": email})
+
+
+def get_user_by_id(user_id: str):
+    """Returns the user document for the given ObjectId string, or None."""
+    db = _get_db()
+    try:
+        return db[USERS_COLLECTION].find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Portfolio (ticker watchlist)
+# ---------------------------------------------------------------------------
+
+def get_portfolio(user_id: str) -> list:
+    """Returns the user's list of watched ticker symbols, or an empty list."""
+    db = _get_db()
+    doc = db[PORTFOLIOS_COLLECTION].find_one({"user_id": user_id})
+    if doc:
+        return doc.get("tickers", [])
+    return []
+
+
+def add_to_portfolio(user_id: str, ticker: str) -> list:
+    """Adds a ticker to the user's watchlist (idempotent). Returns the updated list."""
+    db = _get_db()
+    ticker = ticker.strip().upper()
+    db[PORTFOLIOS_COLLECTION].update_one(
+        {"user_id": user_id},
+        {"$addToSet": {"tickers": ticker}},
+        upsert=True,
+    )
+    return get_portfolio(user_id)
+
+
+def remove_from_portfolio(user_id: str, ticker: str) -> list:
+    """Removes a ticker from the user's watchlist. Returns the updated list."""
+    db = _get_db()
+    ticker = ticker.strip().upper()
+    db[PORTFOLIOS_COLLECTION].update_one(
+        {"user_id": user_id},
+        {"$pull": {"tickers": ticker}},
+    )
+    return get_portfolio(user_id)
+
+
+# ---------------------------------------------------------------------------
+# Chat history persistence
+# ---------------------------------------------------------------------------
+
+def save_chat_message(user_id: str, thread_id: str, context_key: str,
+                      role: str, content: str, extra: dict = None):
+    """Persists a single chat message (user or agent) to MongoDB."""
+    db = _get_db()
+    doc = {
+        "user_id": user_id,
+        "thread_id": thread_id,
+        "context_key": context_key,
+        "role": role,
+        "content": content,
+        "created_at": datetime.datetime.now(datetime.timezone.utc),
+    }
+    if extra:
+        doc["extra"] = extra
+    db[CHAT_HISTORY_COLLECTION].insert_one(doc)
+
+
+def get_chat_history(user_id: str, context_key: str) -> list:
+    """Returns all messages for a user's conversation in a specific context, oldest first."""
+    db = _get_db()
+    cursor = db[CHAT_HISTORY_COLLECTION].find(
+        {"user_id": user_id, "context_key": context_key},
+        {"_id": 0, "user_id": 0},
+    ).sort("created_at", 1)
+    return list(cursor)
+
+
+def get_user_threads(user_id: str) -> list:
+    """Returns a list of distinct conversation contexts for a user, with the latest message
+    timestamp and thread_id for each."""
+    db = _get_db()
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$sort": {"created_at": -1}},
+        {"$group": {
+            "_id": "$context_key",
+            "thread_id": {"$first": "$thread_id"},
+            "last_message_at": {"$first": "$created_at"},
+            "message_count": {"$sum": 1},
+        }},
+        {"$sort": {"last_message_at": -1}},
+    ]
+    results = []
+    for row in db[CHAT_HISTORY_COLLECTION].aggregate(pipeline):
+        results.append({
+            "context_key": row["_id"],
+            "thread_id": row["thread_id"],
+            "last_message_at": row["last_message_at"],
+            "message_count": row["message_count"],
+        })
+    return results
+
+
+def delete_chat_history(user_id: str, context_key: str) -> int:
+    """Deletes all messages for a user's conversation in a specific context.
+    Returns the number of deleted messages."""
+    db = _get_db()
+    result = db[CHAT_HISTORY_COLLECTION].delete_many(
+        {"user_id": user_id, "context_key": context_key}
+    )
+    return result.deleted_count

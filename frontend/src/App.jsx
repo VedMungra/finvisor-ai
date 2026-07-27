@@ -13,8 +13,13 @@ import {
   SquarePen,
   ImageOff,
   RefreshCw,
+  LogOut,
+  User,
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
+import { useAuth } from './AuthContext';
+import AuthPage from './AuthPage';
+import PortfolioPanel from './PortfolioPanel';
 import './index.css';
 
 // VITE_API_URL is optional (fall back to the local dev backend) and may legitimately be
@@ -65,53 +70,62 @@ async function readErrorDetail(response) {
 /** Single entry point for every backend call: absolute URL, hard timeout, caller-supplied
  *  cancellation, `response.ok` checking and JSON-shape validation. Throws an Error whose
  *  message is safe to show directly to the user. */
-async function apiFetch(path, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, ...init } = {}) {
-  const controller = new AbortController();
-  let timedOut = false;
+function createApiFetch(tokenRef) {
+  return async function apiFetch(path, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, ...init } = {}) {
+    const controller = new AbortController();
+    let timedOut = false;
 
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
 
-  const forwardAbort = () => controller.abort();
-  if (signal) {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener('abort', forwardAbort);
-  }
+    const forwardAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener('abort', forwardAbort);
+    }
 
-  try {
-    const response = await fetch(`${API_URL}${path}`, { ...init, signal: controller.signal });
-
-    if (!response.ok) {
-      throw new Error(await readErrorDetail(response));
+    // Inject auth header if a token is available
+    const headers = { ...(init.headers || {}) };
+    const currentToken = tokenRef.current;
+    if (currentToken && !headers.Authorization) {
+      headers.Authorization = `Bearer ${currentToken}`;
     }
 
     try {
-      return await response.json();
-    } catch {
-      throw new Error('The server returned a response that could not be read as JSON.');
-    }
-  } catch (error) {
-    if (error?.name === 'AbortError') {
-      if (timedOut) {
-        const timeoutError = new Error(
-          `The server did not respond within ${Math.round(timeoutMs / 1000)}s. It may still be working — try again in a moment.`
-        );
-        timeoutError.name = 'TimeoutError';
-        throw timeoutError;
+      const response = await fetch(`${API_URL}${path}`, { ...init, headers, signal: controller.signal });
+
+      if (!response.ok) {
+        throw new Error(await readErrorDetail(response));
       }
-      throw error; // Deliberate cancellation by the caller — handled upstream.
+
+      try {
+        return await response.json();
+      } catch {
+        throw new Error('The server returned a response that could not be read as JSON.');
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        if (timedOut) {
+          const timeoutError = new Error(
+            `The server did not respond within ${Math.round(timeoutMs / 1000)}s. It may still be working — try again in a moment.`
+          );
+          timeoutError.name = 'TimeoutError';
+          throw timeoutError;
+        }
+        throw error; // Deliberate cancellation by the caller — handled upstream.
+      }
+      if (error instanceof TypeError) {
+        // fetch() only rejects with TypeError for network/CORS level failures.
+        throw new Error(`Could not reach the Finvisor backend at ${API_URL}. Is the API running?`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', forwardAbort);
     }
-    if (error instanceof TypeError) {
-      // fetch() only rejects with TypeError for network/CORS level failures.
-      throw new Error(`Could not reach the Finvisor backend at ${API_URL}. Is the API running?`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener('abort', forwardAbort);
-  }
+  };
 }
 
 const makeMessage = (role, content, extra = {}) => ({
@@ -169,6 +183,14 @@ function ChartImage({ data }) {
 }
 
 function App() {
+  const { user, token, isAuthenticated, loading: authLoading, logout } = useAuth();
+
+  // Keep a ref to the token so apiFetch always reads the latest value without re-creating
+  const tokenRef = useRef(token);
+  useEffect(() => { tokenRef.current = token; }, [token]);
+
+  const apiFetch = useMemo(() => createApiFetch(tokenRef), []);
+
   const [documents, setDocuments] = useState([]);
   const [documentsError, setDocumentsError] = useState(null);
   const [activeDocument, setActiveDocument] = useState(null); // null = Global Agent
@@ -181,6 +203,7 @@ function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
   const [feedback, setFeedback] = useState({}); // messageId -> { rating, status, error }
+  const [portfolio, setPortfolio] = useState([]);
 
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -306,13 +329,57 @@ function App() {
       if (error?.name === 'AbortError' || !isMountedRef.current) return;
       setDocumentsError(error?.message || 'Could not load the document list.');
     }
-  }, []);
+  }, [apiFetch]);
+
+  // Fetch portfolio on login
+  const fetchPortfolio = useCallback(async () => {
+    if (!isAuthenticated) return;
+    try {
+      const data = await apiFetch('/portfolio');
+      if (isMountedRef.current) {
+        setPortfolio(data?.tickers || []);
+      }
+    } catch {
+      // Portfolio fetch failure is non-critical
+    }
+  }, [isAuthenticated, apiFetch]);
+
+  // Load chat history for a context from the backend
+  const loadChatHistory = useCallback(async (contextKey) => {
+    if (!isAuthenticated) return;
+    try {
+      const data = await apiFetch(`/chat-history/${encodeURIComponent(contextKey)}`);
+      if (!isMountedRef.current) return;
+      const messages = data?.messages || [];
+      if (messages.length > 0) {
+        const restored = messages.map((m) =>
+          makeMessage(m.role, m.content, {
+            ...(m.extra || {}),
+            // Mark as restored so we don't re-persist
+            restored: true,
+          })
+        );
+        setChats((prev) => {
+          // Only restore if the current chat is empty (don't overwrite live conversation)
+          if (!prev[contextKey] || prev[contextKey].length === 0) {
+            return { ...prev, [contextKey]: restored };
+          }
+          return prev;
+        });
+      }
+    } catch {
+      // History fetch failure is non-critical
+    }
+  }, [isAuthenticated, apiFetch]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     const controller = new AbortController();
     fetchDocuments(controller.signal);
+    fetchPortfolio();
+    loadChatHistory(GLOBAL_KEY);
     return () => controller.abort();
-  }, [fetchDocuments]);
+  }, [isAuthenticated, fetchDocuments, fetchPortfolio, loadChatHistory]);
 
   const handleCancelRequest = useCallback(() => {
     chatAbortRef.current?.abort();
@@ -337,7 +404,7 @@ function App() {
       chatAbortRef.current = controller;
 
       try {
-        const payload = { prompt: userPrompt, thread_id: threadId };
+        const payload = { prompt: userPrompt, thread_id: threadId, context_key: key };
         if (sourceFilename) payload.source_filename = sourceFilename;
 
         const data = await apiFetch('/chat', {
@@ -380,7 +447,7 @@ function App() {
         if (isMountedRef.current) setPendingKey(null);
       }
     },
-    [activeDocument, appendMessage, getThreadId, inputValue]
+    [activeDocument, appendMessage, getThreadId, inputValue, apiFetch]
   );
 
   const handleFeedback = useCallback(
@@ -412,7 +479,7 @@ function App() {
         }));
       }
     },
-    [feedback]
+    [feedback, apiFetch]
   );
 
   const handleFileUpload = useCallback(
@@ -466,7 +533,7 @@ function App() {
         if (isMountedRef.current) setIsUploading(false);
       }
     },
-    [fetchDocuments, showStatus]
+    [fetchDocuments, showStatus, apiFetch]
   );
 
   const handleClearDatabase = useCallback(async () => {
@@ -494,7 +561,9 @@ function App() {
     } finally {
       if (isMountedRef.current) setIsClearing(false);
     }
-  }, [isClearing, showStatus, writeThreads]);
+  }, [isClearing, showStatus, writeThreads, apiFetch]);
+
+
 
   const handleKeyDown = useCallback(
     (e) => {
@@ -512,8 +581,10 @@ function App() {
       const key = doc || GLOBAL_KEY;
       getThreadId(key);
       setChats((prev) => (prev[key] ? prev : { ...prev, [key]: [] }));
+      // Load persisted history for this context
+      loadChatHistory(key);
     },
-    [getThreadId]
+    [getThreadId, loadChatHistory]
   );
 
   const handleDocKeyDown = useCallback(
@@ -526,9 +597,35 @@ function App() {
     [selectDocument]
   );
 
+  const handleDeleteDocument = useCallback(
+    async (e, doc) => {
+      e.stopPropagation(); // Don't trigger selectDocument when clicking the trash can
+      if (!window.confirm(`Are you sure you want to delete "${doc}"?`)) return;
+
+      try {
+        const data = await apiFetch(`/documents/${encodeURIComponent(doc)}`, { method: 'DELETE', timeoutMs: CLEAR_TIMEOUT_MS });
+        if (!isMountedRef.current) return;
+        
+        showStatus(data?.message || `Deleted ${doc}`, 'success');
+        
+        // If we just deleted the active document, fall back to global agent
+        if (activeDocument === doc) {
+          selectDocument(null);
+        }
+        
+        // Remove from local state and trigger a refresh from the server just to be perfectly synced
+        setDocuments((prev) => prev.filter((d) => d !== doc));
+      } catch (error) {
+        if (!isMountedRef.current) return;
+        showStatus(error?.message || `Could not delete ${doc}.`, 'error');
+      }
+    },
+    [activeDocument, selectDocument, showStatus, apiFetch]
+  );
+
   /** Starts a genuinely fresh conversation: new thread id (so the backend checkpointer starts
    *  from an empty state) and an empty transcript for the active context only. */
-  const handleNewChat = useCallback(() => {
+  const handleNewChat = useCallback(async () => {
     const inFlight = chatAbortRef.current;
     if (inFlight) {
       // Suppress the reply/cancellation notice so it can't land in the freshly emptied chat.
@@ -538,8 +635,63 @@ function App() {
     const key = activeDocument || GLOBAL_KEY;
     writeThreads((prev) => ({ ...prev, [key]: uuidv4() }));
     setChats((prev) => ({ ...prev, [key]: [] }));
+
+    // Also clear persisted history for this context
+    if (isAuthenticated) {
+      try {
+        await apiFetch(`/chat-history/${encodeURIComponent(key)}`, { method: 'DELETE' });
+      } catch {
+        // Non-critical
+      }
+    }
+
     inputRef.current?.focus();
-  }, [activeDocument, writeThreads]);
+  }, [activeDocument, writeThreads, isAuthenticated, apiFetch]);
+
+  const handleTickerClick = useCallback(
+    (ticker) => {
+      const prompt = `📊 Plot a 6-month historical performance chart for ${ticker}`;
+      const userMessageIndex = currentMessages.findIndex(
+        (m) => m.role === 'user' && m.content === prompt
+      );
+
+      if (userMessageIndex !== -1) {
+        showStatus(`A chart for ${ticker} has already been plotted in this conversation.`, 'info');
+        // The actual chart is the agent's response, which is usually the very next message
+        const targetMessage = currentMessages[userMessageIndex + 1] || currentMessages[userMessageIndex];
+        const element = document.getElementById(`message-${targetMessage.id}`);
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          element.animate(
+            [
+              { backgroundColor: 'rgba(59, 130, 246, 0.4)' },
+              { backgroundColor: 'transparent' }
+            ],
+            { duration: 1500, easing: 'ease-out' }
+          );
+        }
+        return;
+      }
+
+      handleSend(prompt);
+    },
+    [handleSend, currentMessages, showStatus]
+  );
+
+  // Show loading spinner while checking stored token
+  if (authLoading) {
+    return (
+      <div className="auth-loading">
+        <span className="loader" style={{ width: '40px', height: '40px', borderWidth: '3px' }} />
+        <p>Loading Finvisor AI…</p>
+      </div>
+    );
+  }
+
+  // Show auth page if not logged in
+  if (!isAuthenticated) {
+    return <AuthPage />;
+  }
 
   const inputPlaceholder = !isPending
     ? 'Type your message here...'
@@ -553,6 +705,26 @@ function App() {
       <div className="glass-panel sidebar">
         <h2>📈 Finvisor AI</h2>
 
+        {/* User profile */}
+        <div className="user-profile">
+          <div className="user-avatar">
+            <User size={18} />
+          </div>
+          <div className="user-info">
+            <span className="user-name">{user?.username || 'User'}</span>
+            <span className="user-email">{user?.email || ''}</span>
+          </div>
+          <button
+            type="button"
+            className="logout-btn"
+            onClick={logout}
+            title="Sign out"
+            aria-label="Sign out"
+          >
+            <LogOut size={16} />
+          </button>
+        </div>
+
         <label className={`file-upload-box${isUploading ? ' is-disabled' : ''}`}>
           <input
             type="file"
@@ -561,11 +733,15 @@ function App() {
             onChange={handleFileUpload}
             disabled={isUploading}
           />
-          <UploadCloud size={48} style={{ marginBottom: '12px' }} />
-          <p style={{ fontWeight: 500, color: 'var(--text-primary)' }}>
-            {isUploading ? 'Uploading…' : 'Upload Document'}
-          </p>
-          <p style={{ fontSize: '0.85rem' }}>Markdown or PDF reports, up to 25 MB</p>
+          <UploadCloud size={24} style={{ color: 'var(--accent-color)', flexShrink: 0 }} />
+          <div style={{ textAlign: 'left', minWidth: 0 }}>
+            <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: '0.95rem' }}>
+              {isUploading ? 'Uploading…' : 'Upload Document'}
+            </div>
+            <div style={{ fontSize: '0.75rem', marginTop: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              Max 25 MB (.pdf, .md)
+            </div>
+          </div>
         </label>
 
         {isUploading && (
@@ -578,6 +754,14 @@ function App() {
             {uploadStatus.text}
           </div>
         )}
+
+        {/* Portfolio */}
+        <PortfolioPanel
+          token={token}
+          tickers={portfolio}
+          onTickersChange={setPortfolio}
+          onTickerClick={handleTickerClick}
+        />
 
         <div className="document-list">
           <h3
@@ -611,7 +795,16 @@ function App() {
               title={doc}
             >
               <Database size={16} style={{ marginRight: '8px', flexShrink: 0 }} />
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{doc}</span>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{doc}</span>
+              <button
+                type="button"
+                className="doc-delete-btn"
+                onClick={(e) => handleDeleteDocument(e, doc)}
+                title="Delete this document"
+                aria-label="Delete document"
+              >
+                <Trash2 size={14} />
+              </button>
             </div>
           ))}
 
@@ -664,7 +857,7 @@ function App() {
           {messageCount === 0 && (
             <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-secondary)' }}>
               <h3 style={{ fontSize: '1.8rem', marginBottom: '12px', color: 'var(--text-primary)' }}>
-                {activeDocument ? `Analyze ${activeDocument}` : 'How can I assist you today?'}
+                {activeDocument ? `Analyze ${activeDocument}` : `Welcome back, ${user?.username || 'User'}!`}
               </h3>
               <p style={{ marginBottom: '32px', fontSize: '1.2rem' }}>
                 {activeDocument
@@ -679,6 +872,7 @@ function App() {
             return (
               <div
                 key={msg.id}
+                id={`message-${msg.id}`}
                 className={`message-bubble message-${msg.role}${msg.isError ? ' message-error' : ''}`}
               >
                 {msg.role === 'user' ? (

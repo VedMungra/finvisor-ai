@@ -26,3 +26,5 @@ PyMuPDF>=1.25.0
 pymongo>=4.9.0
 langchain-ollama>=0.2.0
 redis>=5.0.0
+python-jose[cryptography]>=3.4.0
+bcrypt>=4.0.0

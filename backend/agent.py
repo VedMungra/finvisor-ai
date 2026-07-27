@@ -306,7 +306,19 @@ def retrieve_node(state: AgentState):
                 update["messages"] = [RemoveMessage(id=last.id)]
 
     try:
-        docs = get_retriever_instance().invoke(question, source_filename)
+        retriever = get_retriever_instance()
+        docs = retriever.invoke(question, source_filename)
+        
+        # If querying within a document, the user's specific question (e.g. "fetch macroeconomic news")
+        # might retrieve chunks that don't actually mention the company name, causing the LLM to
+        # fail to use external tools. We inject a baseline identity chunk to guarantee context.
+        if source_filename:
+            identity_docs = retriever.invoke("What company, organization, or entity is the primary subject of this document?", source_filename)
+            if identity_docs:
+                identity_chunk = identity_docs[0]
+                if not any(d.page_content == identity_chunk.page_content for d in docs):
+                    docs.insert(0, identity_chunk)
+                    
     except Exception as e:
         logger.error(f"Retrieval failed for '{question}': {e}", exc_info=True)
         docs = []
@@ -1357,7 +1369,7 @@ workflow.add_conditional_edges(
     {
         "web_search": "web_search",
         "generate": "generate",
-    }
+    },
 )
 workflow.add_edge("web_search", "generate")
 
