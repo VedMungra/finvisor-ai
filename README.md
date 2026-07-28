@@ -125,6 +125,36 @@ graph TD
 
 ---
 
+## 🔍 How the RAG Pipeline Works
+
+When you upload a financial document (a 10-K, an earnings call transcript, a PDF filing), it goes through a 5-stage ingestion and retrieval pipeline before any question can be answered from it.
+
+### Stage 1 — Structural Chunking (Parent Split)
+Raw text is first split at a **semantic level** using `MarkdownHeaderTextSplitter`. It scans for document headers (`#`, `##`, `###`) to identify natural section boundaries like `Company`, `Fiscal_Quarter`, and `Section`. This is a two-phase design borrowed from the "Parent-Child" chunking pattern:
+- **Why not just split by character count?** Blind character splits sever mid-sentence or mid-table, producing chunks that are individually meaningless. Splitting at section headers means every chunk inherits structural context — the retriever knows a chunk came from *"Apple → Q1 2024 → Financial Results"*, not just from somewhere in a 50-page document.
+- **PDF handling:** PDFs have no Markdown headers, so they are pre-processed into pseudo-Markdown first (`### Page N`), giving the splitter an honest page-level boundary to work with.
+
+### Stage 2 — Fine-Grained Chunking (Child Split)
+The structural blocks from Stage 1 are often too large for the embedding model's strict **512-token context window**. A second pass using `RecursiveCharacterTextSplitter` with a **1200-character limit and 120-character overlap** further subdivides them. The hierarchical separator order (`\n\n` → `\n` → `.` → ` `) ensures sentence boundaries are always preferred over mid-word breaks. Each final chunk inherits the section header metadata from Stage 1.
+
+### Stage 3 — Embedding & Storage
+Each chunk is converted into a vector (a 384-dimensional numerical representation of its meaning) using **`BAAI/bge-small-en-v1.5`** — a compact but highly accurate bi-encoder from Beijing Academy of AI, specifically designed and fine-tuned for retrieval tasks. The vectors, text, and metadata are written into a persistent **ChromaDB** collection.
+- **Re-ingestion is idempotent:** uploading the same file twice deletes its previous chunks first, so the vector store never drifts out of sync with the MongoDB metadata layer.
+- **One singleton, no SQLite locks:** ingestion reuses the same live `retriever.py` instance the API uses for queries, preventing the double-connection SQLite locking bug that would otherwise occur.
+
+### Stage 4 — Two-Stage Retrieval (Semantic Search + Reranking)
+When a question arrives, retrieval runs in two stages:
+
+1. **Stage 1 — Bi-Encoder (fast, approximate):** The question is embedded with the same `bge-small-en-v1.5` model and ChromaDB returns the top candidates via cosine similarity. This is fast because it's a single matrix multiplication over pre-computed vectors.
+2. **Stage 2 — Cross-Encoder Reranker (slow, precise):** The top candidates are re-scored by **`cross-encoder/ms-marco-MiniLM-L-6-v2`**, a model that jointly encodes the question *and each passage together* to produce a much more accurate relevance score. The results are re-sorted by this score. Cross-encoders are far more accurate than bi-encoders but too slow to run over the whole corpus — this two-stage design gets the precision of a cross-encoder with the speed of a vector search.
+
+### Stage 5 — Grounded Answer Synthesis
+The top re-ranked passages are handed to the LLM synthesis model with a strict prompt that instructs it to answer **only** from that context. No passage, no answer — the model is told to say it doesn't know rather than hallucinate. This is what makes answers factual and citation-worthy instead of confidently wrong.
+
+> **Why this matches on meaning, not keywords:** because the query and the passages are encoded into the same vector space, a question phrased as *"did revenue grow?"* will match a passage that says *"net sales increased 11% year-over-year"* — even though none of those words appear in the question. Semantic similarity is computed over meaning, not surface text.
+
+---
+
 ## 💻 Tech Stack
 
 ### **Backend & AI Engine**
