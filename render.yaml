@@ -40,6 +40,14 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.9
 
+      # --- Memory tuning for the free tier (512MB limit) ---
+      # Prevents glibc from allocating too many memory arenas for threads, which artificially
+      # inflates the process's memory footprint and triggers OOM kills during PyTorch imports.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: OMP_NUM_THREADS
+        value: "1"
+
       # --- Persistence (required) ---
       # Without MONGODB_URI the app cannot store uploads, charts, metadata or feedback. This
       # was missing from the previous version of this file entirely, so a deploy straight from
